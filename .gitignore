@@ -10,3 +10,6 @@ riichienv-ml-xt/
 debug-riichienv-with-mortal
 mjsoul-parser
 **/.ipynb_checkpoints
+
+# Downloaded model checkpoints (e.g. zangjiucheng/riichippo weights)
+weights/
