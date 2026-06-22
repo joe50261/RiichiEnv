@@ -10,3 +10,9 @@ riichienv-ml-xt/
 debug-riichienv-with-mortal
 mjsoul-parser
 **/.ipynb_checkpoints
+
+# Downloaded model checkpoints (e.g. zangjiucheng/riichippo weights)
+weights/
+# Generated replay 牌譜 exports
+riichippo_*.html
+riichippo_*.jsonl
