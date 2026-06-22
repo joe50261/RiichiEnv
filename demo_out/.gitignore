@@ -1,3 +1,5 @@
 # Generated demo artifacts (reproduce with: uv run python demo_out/visualize_game.py)
 replay.html
 game_log.jsonl
+# Generated screenshots (reproduce with: uv run python demo_out/screenshot.py)
+shots/
