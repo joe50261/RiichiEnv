@@ -307,28 +307,36 @@ def wrap_standalone_html(fragment: str, title: str, subtitle: str = "",
 
 
 COMMENTARY_CSS = """
-  .cmt { margin-top: 18px; }
+  .banner { background: #0b5; background: linear-gradient(90deg,#1e8449,#2471a3);
+            color: #fff; border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .banner h2 { font-size: 18px; margin: 0 0 6px; }
+  .banner .stat { display: inline-block; background: rgba(255,255,255,.18);
+                  border-radius: 6px; padding: 4px 10px; margin: 4px 8px 0 0;
+                  font-size: 13px; font-weight: 600; }
+  .banner .legend { font-size: 12px; margin-top: 8px; opacity: .95; }
+  .banner .legend b { padding: 1px 6px; border-radius: 3px; }
   .cmt h2 { font-size: 15px; margin: 18px 0 8px; }
-  .cmt .legend { font-size: 12px; color: #555; margin-bottom: 10px; }
-  .cmt .legend b { padding: 1px 5px; border-radius: 3px; color: #fff; }
   .kyoku { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px;
            padding: 10px 12px; margin-bottom: 12px; }
   .kyoku h3 { font-size: 13px; margin: 0 0 8px; color: #333; }
-  .river { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px;
-           margin: 2px 0 10px; }
-  .seat { font-size: 12px; color: #666; width: 64px; flex: none; padding-top: 6px; }
-  .tile { position: relative; min-width: 30px; text-align: center; font-size: 13px;
-          font-weight: 600; padding: 4px 3px 3px; border: 1px solid #cfcfcf;
-          border-radius: 4px; background: #fafafa; }
+  .river { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 5px;
+           margin: 2px 0 12px; }
+  .seat { font-size: 12px; color: #666; width: 64px; flex: none; padding-top: 8px; }
+  .tile { position: relative; min-width: 34px; text-align: center; font-size: 15px;
+          font-weight: 700; padding: 5px 4px 4px; border: 1px solid #cfcfcf;
+          border-radius: 5px; background: #fafafa; }
   .tile.m { color: #c0392b; } .tile.p { color: #2471a3; }
   .tile.s { color: #1e8449; } .tile.z { color: #444; }
   .tile.tsumogiri { opacity: 0.5; }
   .tile.reach { background: #fff3cd; border-color: #e0a800; }
-  .conf { height: 3px; margin-top: 3px; background: #2ecc71; border-radius: 2px; }
-  .badge { display: block; font-size: 9px; font-weight: 700; margin-top: 2px;
-           padding: 0 2px; border-radius: 2px; color: #fff; white-space: nowrap; }
+  .tile.special { box-shadow: 0 0 0 2px #c0392b; }
+  .conf { height: 3px; margin-top: 4px; background: #2ecc71; border-radius: 2px; }
+  .badge { display: block; font-size: 10px; font-weight: 700; margin-top: 3px;
+           padding: 1px 2px; border-radius: 3px; color: #fff; white-space: nowrap; }
   .b-kan { background: #c0392b; } .b-riichi { background: #2471a3; }
   .b-agari { background: #1e8449; }
+  .viewer-h { font-size: 15px; margin: 22px 0 8px; color: #333;
+              border-top: 2px solid #ddd; padding-top: 14px; }
 """
 
 
@@ -367,9 +375,11 @@ def _discard_tile_html(rec: dict) -> str:
             badges.append(f'<span class="badge b-agari">自摸 {p * 100:.0f}%</span>')
         elif kind == "riichi" and p >= 0.08:
             badges.append(f'<span class="badge b-riichi">立直 {p * 100:.0f}%</span>')
+    if badges:
+        cls.append("special")
 
     tip = f"{_fmt_topk(rec['topk'])}　(信心 {rec['conf'] * 100:.0f}%)"
-    conf_bar = f'<div class="conf" style="width:{max(3, round(rec["conf"] * 28))}px"></div>'
+    conf_bar = f'<div class="conf" style="width:{max(3, round(rec["conf"] * 32))}px"></div>'
     return (f'<div class="{" ".join(cls)}" title="{_html.escape(tip)}">'
             f'{_html.escape(pai)}{conf_bar}{"".join(badges)}</div>')
 
@@ -388,10 +398,33 @@ def build_commentary_html(decisions: list, n_players: int) -> str:
             kyokus[kl] = {"meta": rec.get("kyoku_meta"), "rivers": {p: [] for p in range(n_players)}}
         kyokus[kl]["rivers"][rec["pid"]].append(rec)
 
-    parts = ['<div class="cmt">', "<h2>模型解說 — 每張捨牌的策略機率</h2>",
-             '<div class="legend">每張牌下方數字條=該手信心;徽章=當下「可做但沒做」的特殊動作'
-             '(<b class="b-kan">槓</b> <b class="b-riichi">立直</b> <b class="b-agari">自摸</b>),'
-             '滑鼠移到牌上可看完整動作機率排名。</div>']
+    # Summary: how often a special action was available but declined.
+    n_kan = n_riichi = n_agari = n_disc = 0
+    for rec in decisions:
+        if rec.get("chosen_kind") != "discard":
+            continue
+        n_disc += 1
+        kinds = {k for _, k, _ in rec.get("specials", [])}
+        n_kan += "kan" in kinds
+        n_riichi += "riichi" in kinds
+        n_agari += "agari" in kinds
+
+    parts = [
+        '<div class="cmt">',
+        '<div class="banner">',
+        "<h2>🀄 模型解說(本頁重點)</h2>",
+        '<div>以下把模型對<strong>每一張捨牌</strong>的策略機率,寫在對應牌的正下方。</div>',
+        f'<span class="stat">捨牌決策 {n_disc}</span>',
+        f'<span class="stat">可槓未槓 {n_kan}</span>',
+        f'<span class="stat">可立直未立直 {n_riichi}</span>',
+        f'<span class="stat">可自摸未和 {n_agari}</span>',
+        '<div class="legend">牌下綠條=該手信心;紅框+徽章=當下「可做卻沒做」的特殊動作'
+        '(<b style="background:#c0392b;color:#fff">槓</b> '
+        '<b style="background:#2471a3;color:#fff">立直</b> '
+        '<b style="background:#1e8449;color:#fff">自摸</b>)並附機率;'
+        '滑鼠移到任一張牌可看完整動作機率排名。</div>',
+        "</div>",
+    ]
     for kl, data in kyokus.items():
         meta = data["meta"] or {}
         head = (f'{_html.escape(str(kl))}　親:P{meta.get("oya", "?")}　'
@@ -410,10 +443,16 @@ def export_replay_html(env, path: str, title: str, subtitle: str,
     fragment = env.get_viewer().show().data
     if not isinstance(fragment, str):
         fragment = ""
-    fragment = fragment + commentary_html
+    viewer_block = fragment
+    if commentary_html:
+        # Commentary first (the 3D canvas is tall and would otherwise push it
+        # below the fold), then the interactive replay underneath.
+        viewer_block = ('<h2 class="viewer-h">互動式 3D replay(可拖曳/逐步播放)</h2>'
+                        + fragment)
+    body = commentary_html + viewer_block
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(
-        wrap_standalone_html(fragment, title, subtitle, extra_css), encoding="utf-8")
+        wrap_standalone_html(body, title, subtitle, extra_css), encoding="utf-8")
     print(f"\nReplay 牌譜 written to: {path}")
 
 
