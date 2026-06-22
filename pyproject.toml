@@ -91,7 +91,7 @@ testpaths = ["tests"]
 norecursedirs = ["trunk"]
 
 [tool.ty.src]
-exclude = ["scripts", "tests", "demos", "riichienv-ml", "riichienv-ml-xt", "riichienv-validation", "riichienv-ui/demos"]
+exclude = ["scripts", "tests", "demos", "riichienv-ml", "riichienv-ml-xt", "riichienv-validation", "riichienv-ui/demos", "demo_out/train_native_agent.py", "demo_out/eval_native_agent.py"]
 
 [tool.importlinter]
 root_packages = ["riichienv"]

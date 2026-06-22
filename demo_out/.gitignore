@@ -3,3 +3,5 @@ replay.html
 game_log.jsonl
 # Generated screenshots (reproduce with: uv run python demo_out/screenshot.py)
 shots/
+# Generated native agent checkpoint (reproduce with: uv run python demo_out/train_native_agent.py)
+native_agent.pth
