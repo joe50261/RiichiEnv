@@ -65,6 +65,28 @@ Open the resulting `.html` file in a browser to step through the hand with the
 interactive 3D board (hands, melds, dora, riichi, waits and win results are all
 annotated by the viewer).
 
+### Annotating the model's reasoning (`--explain`)
+
+Add `--explain` (together with `--export-html`) to write the model's policy
+**under each tile in the discard river**: a confidence bar for the chosen move,
+and a badge whenever a special action was *available but declined* on that draw
+— <span style="color:#c0392b">槓 (kan)</span>,
+<span style="color:#2471a3">立直 (riichi)</span> or
+<span style="color:#1e8449">自摸 (tsumo-agari)</span> — with its probability.
+Hovering a tile shows the full ranked action probabilities.
+
+```sh
+uv run python riichienv-ml/scripts/infer_riichippo.py \
+    --model weights/riichippo/v1.pth --games 1 --explain \
+    --export-html riichippo_explained_4p.html
+```
+
+This makes decisions like "drew the last 9m but did not kakan" auditable: the
+9m's discard turn shows `槓9m NN%`, confirming the kan was offered (the legal
+mask is correct) and the policy simply ranked discarding higher. `--explain`
+assumes the 4-player (82-action) encoding from
+[ENCODING.md](ENCODING.md).
+
 The script downloads the requested file from `zangjiucheng/riichippo`, infers
 the model type (`actor_head.*` → ActorCriticNetwork, `a_head.*`/`v_head.*` →
 dueling QNetwork) and its dimensions, builds the matching network and the

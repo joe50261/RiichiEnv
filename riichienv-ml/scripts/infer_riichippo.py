@@ -37,9 +37,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import html as _html
+import json
 import os
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 # Make the package importable when run from a source checkout (uninstalled).
@@ -87,6 +89,11 @@ def parse_args() -> argparse.Namespace:
                    help="Print hero (seat 0) decisions step-by-step.")
     p.add_argument("--export-html", type=str, default=None,
                    help="Write the last game's replay as a standalone HTML 牌譜 to this path.")
+    p.add_argument("--explain", action="store_true",
+                   help="Annotate the exported HTML with the model's per-discard policy "
+                        "(written under each tile in the discard river, incl. declined kan/riichi).")
+    p.add_argument("--explain-topk", type=int, default=6,
+                   help="How many ranked actions to keep per decision for the explanation tooltip.")
     return p.parse_args()
 
 
@@ -171,15 +178,53 @@ def build_model(state: dict, arch: dict, device: str) -> torch.nn.Module:
     return model
 
 
+# 4-player (82-action) encoding helpers (see docs/ENCODING.md).
+TILES34 = ([f"{n}{s}" for s in "mps" for n in range(1, 10)]
+           + ["E", "S", "W", "N", "P", "F", "C"])
+
+
+def action_kind_4p(i: int) -> str:
+    if 0 <= i <= 36:
+        return "discard"
+    if i == 37:
+        return "riichi"
+    if 38 <= i <= 40:
+        return "chi"
+    if i == 41:
+        return "pon"
+    if 42 <= i <= 78:
+        return "kan"
+    if i == 79:
+        return "agari"
+    if i == 80:
+        return "ryukyoku"
+    return "pass"
+
+
+def action_label_4p(i: int) -> str:
+    kind = action_kind_4p(i)
+    if kind == "discard":
+        return f"打{TILES34[i]}" if i < 34 else f"discard#{i}"
+    if kind == "kan":
+        t = i - 42
+        return f"槓{TILES34[t]}" if t < 34 else f"kan#{i}"
+    return {"riichi": "立直", "chi": "吃", "pon": "碰",
+            "agari": "和了", "ryukyoku": "流局", "pass": "見逃/跳過"}[kind]
+
+
 class RiichippoAgent:
     """Greedy / sampling policy agent wrapping a riichippo checkpoint."""
 
-    def __init__(self, model, encoder, device, sample=False, temp=1.0):
+    def __init__(self, model, encoder, device, sample=False, temp=1.0,
+                 explain=False, explain_topk=6):
         self.model = model
         self.encoder = encoder
         self.device = torch.device(device)
         self.sample = sample
         self.temp = temp
+        self.explain = explain
+        self.explain_topk = explain_topk
+        self.last_decision: dict | None = None
 
     def reset(self):
         pass
@@ -206,10 +251,35 @@ class RiichippoAgent:
             if not legals:
                 raise ValueError(f"No legal action for action_id={action_idx}")
             action = legals[0]
+
+        self.last_decision = None
+        if self.explain:
+            self.last_decision = self._build_decision(mask, logits, action_idx, action)
         return action
 
+    def _build_decision(self, mask, logits, chosen_idx, action) -> dict:
+        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()  # report at T=1
+        legal = [i for i in range(len(mask)) if mask[i]]
+        order = sorted(legal, key=lambda i: -probs[i])
+        topk = [(int(i), float(probs[i])) for i in order[:self.explain_topk]]
+        specials = [(int(i), action_kind_4p(i), float(probs[i]))
+                    for i in legal
+                    if action_kind_4p(i) in ("riichi", "kan", "agari", "pon", "chi")]
+        mjai = action.to_mjai()
+        if isinstance(mjai, str):
+            mjai = json.loads(mjai)
+        return {
+            "chosen_id": int(chosen_idx),
+            "chosen_kind": action_kind_4p(int(chosen_idx)),
+            "chosen_mjai": mjai,
+            "conf": float(probs[chosen_idx]),
+            "topk": topk,
+            "specials": specials,
+        }
 
-def wrap_standalone_html(fragment: str, title: str, subtitle: str = "") -> str:
+
+def wrap_standalone_html(fragment: str, title: str, subtitle: str = "",
+                         extra_css: str = "") -> str:
     """Wrap a GameViewer HTML fragment into a self-contained HTML document."""
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -223,6 +293,7 @@ def wrap_standalone_html(fragment: str, title: str, subtitle: str = "") -> str:
   header h1 {{ font-size: 16px; margin: 0 0 4px; }}
   header p {{ font-size: 12px; margin: 0; color: #aaa; }}
   .wrap {{ max-width: 1100px; margin: 0 auto; padding: 12px; }}
+{extra_css}
 </style>
 </head>
 <body>
@@ -235,26 +306,152 @@ def wrap_standalone_html(fragment: str, title: str, subtitle: str = "") -> str:
 """
 
 
-def export_replay_html(env, path: str, title: str, subtitle: str) -> None:
+COMMENTARY_CSS = """
+  .cmt { margin-top: 18px; }
+  .cmt h2 { font-size: 15px; margin: 18px 0 8px; }
+  .cmt .legend { font-size: 12px; color: #555; margin-bottom: 10px; }
+  .cmt .legend b { padding: 1px 5px; border-radius: 3px; color: #fff; }
+  .kyoku { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px;
+           padding: 10px 12px; margin-bottom: 12px; }
+  .kyoku h3 { font-size: 13px; margin: 0 0 8px; color: #333; }
+  .river { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px;
+           margin: 2px 0 10px; }
+  .seat { font-size: 12px; color: #666; width: 64px; flex: none; padding-top: 6px; }
+  .tile { position: relative; min-width: 30px; text-align: center; font-size: 13px;
+          font-weight: 600; padding: 4px 3px 3px; border: 1px solid #cfcfcf;
+          border-radius: 4px; background: #fafafa; }
+  .tile.m { color: #c0392b; } .tile.p { color: #2471a3; }
+  .tile.s { color: #1e8449; } .tile.z { color: #444; }
+  .tile.tsumogiri { opacity: 0.5; }
+  .tile.reach { background: #fff3cd; border-color: #e0a800; }
+  .conf { height: 3px; margin-top: 3px; background: #2ecc71; border-radius: 2px; }
+  .badge { display: block; font-size: 9px; font-weight: 700; margin-top: 2px;
+           padding: 0 2px; border-radius: 2px; color: #fff; white-space: nowrap; }
+  .b-kan { background: #c0392b; } .b-riichi { background: #2471a3; }
+  .b-agari { background: #1e8449; }
+"""
+
+
+def _tile_suit_class(pai: str) -> str:
+    p = pai.rstrip("r")
+    if p.endswith("m"):
+        return "m"
+    if p.endswith("p"):
+        return "p"
+    if p.endswith("s"):
+        return "s"
+    return "z"
+
+
+def _fmt_topk(topk: list) -> str:
+    return " | ".join(f"{action_label_4p(i)} {p * 100:.1f}%" for i, p in topk)
+
+
+def _discard_tile_html(rec: dict) -> str:
+    mjai = rec["chosen_mjai"]
+    pai = mjai.get("pai", "?")
+    cls = ["tile", _tile_suit_class(pai)]
+    if mjai.get("tsumogiri"):
+        cls.append("tsumogiri")
+    if mjai.get("reach"):
+        cls.append("reach")
+
+    # Declined special actions available on this very draw (kan / riichi / tsumo-agari).
+    badges = []
+    for i, kind, p in rec.get("specials", []):
+        if i == rec["chosen_id"]:
+            continue
+        if kind == "kan":
+            badges.append(f'<span class="badge b-kan">{_html.escape(action_label_4p(i))} {p * 100:.0f}%</span>')
+        elif kind == "agari":
+            badges.append(f'<span class="badge b-agari">自摸 {p * 100:.0f}%</span>')
+        elif kind == "riichi" and p >= 0.08:
+            badges.append(f'<span class="badge b-riichi">立直 {p * 100:.0f}%</span>')
+
+    tip = f"{_fmt_topk(rec['topk'])}　(信心 {rec['conf'] * 100:.0f}%)"
+    conf_bar = f'<div class="conf" style="width:{max(3, round(rec["conf"] * 28))}px"></div>'
+    return (f'<div class="{" ".join(cls)}" title="{_html.escape(tip)}">'
+            f'{_html.escape(pai)}{conf_bar}{"".join(badges)}</div>')
+
+
+def build_commentary_html(decisions: list, n_players: int) -> str:
+    """Render per-kyoku discard rivers with the model's policy under each tile."""
+    if not decisions:
+        return ""
+    # Group discard decisions by kyoku (preserve order), then by seat.
+    kyokus: "OrderedDict[str, dict]" = OrderedDict()
+    for rec in decisions:
+        if rec.get("chosen_kind") != "discard":
+            continue
+        kl = rec.get("kyoku") or "?"
+        if kl not in kyokus:
+            kyokus[kl] = {"meta": rec.get("kyoku_meta"), "rivers": {p: [] for p in range(n_players)}}
+        kyokus[kl]["rivers"][rec["pid"]].append(rec)
+
+    parts = ['<div class="cmt">', "<h2>模型解說 — 每張捨牌的策略機率</h2>",
+             '<div class="legend">每張牌下方數字條=該手信心;徽章=當下「可做但沒做」的特殊動作'
+             '(<b class="b-kan">槓</b> <b class="b-riichi">立直</b> <b class="b-agari">自摸</b>),'
+             '滑鼠移到牌上可看完整動作機率排名。</div>']
+    for kl, data in kyokus.items():
+        meta = data["meta"] or {}
+        head = (f'{_html.escape(str(kl))}　親:P{meta.get("oya", "?")}　'
+                f'ドラ表示:{_html.escape(str(meta.get("dora_marker", "?")))}')
+        parts.append(f'<div class="kyoku"><h3>{head}</h3>')
+        for p in range(n_players):
+            tiles = "".join(_discard_tile_html(r) for r in data["rivers"][p])
+            parts.append(f'<div class="river"><div class="seat">P{p} 捨て</div>{tiles}</div>')
+        parts.append("</div>")
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def export_replay_html(env, path: str, title: str, subtitle: str,
+                       commentary_html: str = "", extra_css: str = "") -> None:
     fragment = env.get_viewer().show().data
     if not isinstance(fragment, str):
         fragment = ""
+    fragment = fragment + commentary_html
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(wrap_standalone_html(fragment, title, subtitle), encoding="utf-8")
+    Path(path).write_text(
+        wrap_standalone_html(fragment, title, subtitle, extra_css), encoding="utf-8")
     print(f"\nReplay 牌譜 written to: {path}")
 
 
-def play_game(env, agents, hero=0, verbose=False):
+def _scan_kyoku(events, kyoku):
+    """Update current-kyoku label/meta from a list of MJAI event JSON strings."""
+    for s in events or []:
+        try:
+            ev = json.loads(s)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if ev.get("type") == "start_kyoku":
+            kyoku["label"] = f'{ev.get("bakaze", "?")}{ev.get("kyoku", "?")}-{ev.get("honba", 0)}'
+            kyoku["meta"] = {k: ev.get(k) for k in ("bakaze", "kyoku", "honba", "oya", "dora_marker")}
+
+
+def play_game(env, agents, hero=0, verbose=False, decisions=None):
     obs_dict = env.reset()
     steps = 0
+    kyoku = {"label": None, "meta": None}
     while not env.done():
         actions = {}
         for pid, obs in obs_dict.items():
+            need_events = verbose and pid == hero
+            events = obs.new_events() if (decisions is not None or need_events) else None
+            if decisions is not None:
+                _scan_kyoku(events, kyoku)
             action = agents[pid].act(obs)
-            if verbose and pid == hero:
-                events = obs.new_events()
+            if need_events:
                 tail = events[-1] if events else ""
                 print(f"  [hero] {tail}  ->  {action.to_mjai()}")
+            if decisions is not None:
+                dec = getattr(agents[pid], "last_decision", None)
+                if dec is not None:
+                    rec = dict(dec)
+                    rec["pid"] = pid
+                    rec["kyoku"] = kyoku["label"]
+                    rec["kyoku_meta"] = kyoku["meta"]
+                    decisions.append(rec)
             actions[pid] = action
         obs_dict = env.step(actions)
         steps += 1
@@ -278,9 +475,17 @@ def main() -> None:
           f"blocks={arch['num_blocks']} fc={arch['fc_dim']} "
           f"actions={arch['num_actions']} tile_dim={arch['tile_dim']}")
 
+    explain = args.explain and bool(args.export_html)
+    if args.explain and not args.export_html:
+        print("[note] --explain only annotates HTML output; add --export-html PATH.")
+    if explain and arch["num_actions"] != 82:
+        print("[note] --explain action labels assume the 4p (82-action) encoding; disabling.")
+        explain = False
+
     model = build_model(state, arch, args.device)
     encoder = ObservationEncoder(tile_dim=arch["tile_dim"])
-    hero_agent = RiichippoAgent(model, encoder, args.device, sample=args.sample, temp=args.temp)
+    hero_agent = RiichippoAgent(model, encoder, args.device, sample=args.sample, temp=args.temp,
+                                explain=explain, explain_topk=args.explain_topk)
 
     if args.vs_random:
         from riichienv.agents import RandomAgent
@@ -298,11 +503,15 @@ def main() -> None:
     hero_score_total = 0
     last_scores: list[int] = []
     last_ranks: list[int] = []
+    last_decisions: list = []
     for g in range(args.games):
-        steps, scores, ranks = play_game(env, agents, hero=0, verbose=args.verbose)
+        rec = [] if (explain and g == args.games - 1) else None
+        steps, scores, ranks = play_game(env, agents, hero=0, verbose=args.verbose, decisions=rec)
         hero_ranks[ranks[0]] += 1
         hero_score_total += scores[0]
         last_scores, last_ranks = scores, ranks
+        if rec is not None:
+            last_decisions = rec
         print(f"game {g + 1:>3}: steps={steps:>4} scores={scores} ranks={ranks}")
 
     if args.export_html:
@@ -311,7 +520,10 @@ def main() -> None:
         title = f"RiichiEnv 牌譜 — riichippo {weight_name}"
         subtitle = (f"{arch['model_type']} | {game_mode} | {opp} | "
                     f"final scores={last_scores} ranks={last_ranks}")
-        export_replay_html(env, args.export_html, title, subtitle)
+        commentary = build_commentary_html(last_decisions, n_players) if explain else ""
+        export_replay_html(env, args.export_html, title, subtitle,
+                           commentary_html=commentary,
+                           extra_css=COMMENTARY_CSS if explain else "")
 
     print("\n=== summary ===")
     print(f"games           : {args.games}")
