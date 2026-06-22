@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
                    help="Hero (seat 0) uses the model; other seats play randomly.")
     p.add_argument("--verbose", action="store_true",
                    help="Print hero (seat 0) decisions step-by-step.")
+    p.add_argument("--export-html", type=str, default=None,
+                   help="Write the last game's replay as a standalone HTML 牌譜 to this path.")
     return p.parse_args()
 
 
@@ -207,6 +209,41 @@ class RiichippoAgent:
         return action
 
 
+def wrap_standalone_html(fragment: str, title: str, subtitle: str = "") -> str:
+    """Wrap a GameViewer HTML fragment into a self-contained HTML document."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ margin: 0; font-family: system-ui, sans-serif; background: #f5f5f5; }}
+  header {{ padding: 12px 18px; background: #1b1b1b; color: #eee; }}
+  header h1 {{ font-size: 16px; margin: 0 0 4px; }}
+  header p {{ font-size: 12px; margin: 0; color: #aaa; }}
+  .wrap {{ max-width: 1100px; margin: 0 auto; padding: 12px; }}
+</style>
+</head>
+<body>
+<header><h1>{title}</h1><p>{subtitle}</p></header>
+<div class="wrap">
+{fragment}
+</div>
+</body>
+</html>
+"""
+
+
+def export_replay_html(env, path: str, title: str, subtitle: str) -> None:
+    fragment = env.get_viewer().show().data
+    if not isinstance(fragment, str):
+        fragment = ""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(wrap_standalone_html(fragment, title, subtitle), encoding="utf-8")
+    print(f"\nReplay 牌譜 written to: {path}")
+
+
 def play_game(env, agents, hero=0, verbose=False):
     obs_dict = env.reset()
     steps = 0
@@ -259,11 +296,22 @@ def main() -> None:
     env = RiichiEnv(game_mode=game_mode)
     hero_ranks: Counter[int] = Counter()
     hero_score_total = 0
+    last_scores: list[int] = []
+    last_ranks: list[int] = []
     for g in range(args.games):
         steps, scores, ranks = play_game(env, agents, hero=0, verbose=args.verbose)
         hero_ranks[ranks[0]] += 1
         hero_score_total += scores[0]
+        last_scores, last_ranks = scores, ranks
         print(f"game {g + 1:>3}: steps={steps:>4} scores={scores} ranks={ranks}")
+
+    if args.export_html:
+        weight_name = Path(args.model or args.hf_file).name
+        opp = f"RandomAgent x{n_players - 1}" if args.vs_random else "self-play"
+        title = f"RiichiEnv 牌譜 — riichippo {weight_name}"
+        subtitle = (f"{arch['model_type']} | {game_mode} | {opp} | "
+                    f"final scores={last_scores} ranks={last_ranks}")
+        export_replay_html(env, args.export_html, title, subtitle)
 
     print("\n=== summary ===")
     print(f"games           : {args.games}")

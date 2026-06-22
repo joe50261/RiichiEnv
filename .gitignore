@@ -13,3 +13,5 @@ mjsoul-parser
 
 # Downloaded model checkpoints (e.g. zangjiucheng/riichippo weights)
 weights/
+# Generated replay 牌譜 exports
+riichippo_*.html

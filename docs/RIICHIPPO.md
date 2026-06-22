@@ -49,6 +49,22 @@ uv run python riichienv-ml/scripts/infer_riichippo.py \
 uv run python riichienv-ml/scripts/infer_riichippo.py --model path/to/model.pth
 ```
 
+## Export a replay 牌譜 (standalone HTML)
+
+Add `--export-html` to write the last game as a **self-contained** HTML replay
+(the 3D viewer JS is embedded, so the file opens in any modern browser with no
+server or extra assets):
+
+```sh
+# Four riichippo agents play each other; save the replay 牌譜
+uv run python riichienv-ml/scripts/infer_riichippo.py \
+    --model weights/riichippo/v1.pth --games 1 --export-html riichippo_selfplay_4p.html
+```
+
+Open the resulting `.html` file in a browser to step through the hand with the
+interactive 3D board (hands, melds, dora, riichi, waits and win results are all
+annotated by the viewer).
+
 The script downloads the requested file from `zangjiucheng/riichippo`, infers
 the model type (`actor_head.*` → ActorCriticNetwork, `a_head.*`/`v_head.*` →
 dueling QNetwork) and its dimensions, builds the matching network and the
