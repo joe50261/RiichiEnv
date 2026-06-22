@@ -15,3 +15,4 @@ mjsoul-parser
 weights/
 # Generated replay 牌譜 exports
 riichippo_*.html
+riichippo_*.jsonl

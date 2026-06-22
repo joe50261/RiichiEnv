@@ -94,6 +94,9 @@ def parse_args() -> argparse.Namespace:
                         "(written under each tile in the discard river, incl. declined kan/riichi).")
     p.add_argument("--explain-topk", type=int, default=6,
                    help="How many ranked actions to keep per decision for the explanation tooltip.")
+    p.add_argument("--from-log", type=str, default=None,
+                   help="Annotate an EXISTING MJAI .jsonl replay (same game/wall) instead of "
+                        "playing a new one; overlays the model policy and writes --export-html.")
     return p.parse_args()
 
 
@@ -259,23 +262,42 @@ class RiichippoAgent:
 
     def _build_decision(self, mask, logits, chosen_idx, action) -> dict:
         probs = torch.softmax(logits, dim=1)[0].cpu().numpy()  # report at T=1
+        mjai = action.to_mjai()
+        if isinstance(mjai, str):
+            mjai = json.loads(mjai)
+        rec = self._policy_record(mask, probs, int(chosen_idx))
+        rec["chosen_kind"] = action_kind_4p(int(chosen_idx))
+        rec["chosen_mjai"] = mjai
+        return rec
+
+    def _policy_record(self, mask, probs, chosen_id: int) -> dict:
         legal = [i for i in range(len(mask)) if mask[i]]
         order = sorted(legal, key=lambda i: -probs[i])
         topk = [(int(i), float(probs[i])) for i in order[:self.explain_topk]]
         specials = [(int(i), action_kind_4p(i), float(probs[i]))
                     for i in legal
                     if action_kind_4p(i) in ("riichi", "kan", "agari", "pon", "chi")]
-        mjai = action.to_mjai()
-        if isinstance(mjai, str):
-            mjai = json.loads(mjai)
         return {
-            "chosen_id": int(chosen_idx),
-            "chosen_kind": action_kind_4p(int(chosen_idx)),
-            "chosen_mjai": mjai,
-            "conf": float(probs[chosen_idx]),
+            "chosen_id": int(chosen_id),
+            "conf": float(probs[chosen_id]),
             "topk": topk,
             "specials": specials,
         }
+
+    @torch.inference_mode()
+    def policy_for(self, obs, chosen_id: int) -> dict:
+        """Compute the policy record for a given observation and a known choice.
+
+        Used to overlay model probabilities onto an existing replay log without
+        re-playing the game."""
+        feat = self.encoder.encode(obs).to(self.device).unsqueeze(0)
+        mask = np.frombuffer(obs.mask(), dtype=np.uint8).copy()
+        mask_t = torch.from_numpy(mask).to(self.device).unsqueeze(0)
+        output = self.model(feat)
+        logits = output[0] if isinstance(output, tuple) else output
+        logits = logits.masked_fill(mask_t == 0, -1e9)
+        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+        return self._policy_record(mask, probs, chosen_id)
 
 
 def wrap_standalone_html(fragment: str, title: str, subtitle: str = "",
@@ -438,9 +460,51 @@ def build_commentary_html(decisions: list, n_players: int) -> str:
     return "\n".join(parts)
 
 
+def _strip_meta(ev: dict) -> dict:
+    return {k: v for k, v in ev.items() if k != "meta"}
+
+
+def annotate_log(log: list, agent: "RiichippoAgent", game_mode: str) -> list:
+    """Replay an existing MJAI log and overlay the model's per-discard policy.
+
+    Reconstructs the exact game (same wall) via ``apply_event`` and, just before
+    each discard, computes the model's policy on that observation. Returns the
+    decision records (same shape as live play) for build_commentary_html."""
+    import riichienv.convert as cvt
+    env = RiichiEnv(game_mode=game_mode)
+    decisions: list = []
+    kyoku = {"label": None, "meta": None}
+    for ev in log:
+        et = ev.get("type")
+        if et == "start_kyoku":
+            kyoku["label"] = f'{ev.get("bakaze", "?")}{ev.get("kyoku", "?")}-{ev.get("honba", 0)}'
+            kyoku["meta"] = {k: ev.get(k) for k in ("bakaze", "kyoku", "honba", "oya", "dora_marker")}
+        if et == "dahai":
+            pid = ev["actor"]
+            try:
+                obs = env.get_observation(player_id=pid)
+                chosen_id = cvt.mjai_to_tid(ev["pai"]) // 4   # discard action id == tile-34 index
+                rec = agent.policy_for(obs, chosen_id)
+                rec["chosen_kind"] = "discard"
+                rec["chosen_mjai"] = _strip_meta(ev)
+                rec["pid"] = pid
+                rec["kyoku"] = kyoku["label"]
+                rec["kyoku_meta"] = kyoku["meta"]
+                decisions.append(rec)
+            except Exception as e:  # noqa: BLE001 - keep annotating the rest
+                print(f"  [warn] could not annotate dahai by P{pid} ({ev.get('pai')}): {e}")
+        env.apply_event(_strip_meta(ev))
+    return decisions
+
+
 def export_replay_html(env, path: str, title: str, subtitle: str,
-                       commentary_html: str = "", extra_css: str = "") -> None:
-    fragment = env.get_viewer().show().data
+                       commentary_html: str = "", extra_css: str = "",
+                       log: list | None = None) -> None:
+    if log is not None:
+        from riichienv.visualizer.viewer import GameViewer
+        fragment = GameViewer.from_list(log).show().data
+    else:
+        fragment = env.get_viewer().show().data
     if not isinstance(fragment, str):
         fragment = ""
     viewer_block = fragment
@@ -524,7 +588,25 @@ def main() -> None:
     model = build_model(state, arch, args.device)
     encoder = ObservationEncoder(tile_dim=arch["tile_dim"])
     hero_agent = RiichippoAgent(model, encoder, args.device, sample=args.sample, temp=args.temp,
-                                explain=explain, explain_topk=args.explain_topk)
+                                explain=True, explain_topk=args.explain_topk)
+
+    # ------------------------------------------------------------------
+    # Annotate an existing replay (same game/wall) — does NOT play a new game.
+    # ------------------------------------------------------------------
+    if args.from_log:
+        if not args.export_html:
+            raise SystemExit("--from-log requires --export-html PATH.")
+        with open(args.from_log, encoding="utf-8") as f:
+            log = [json.loads(line) for line in f if line.strip()]
+        print(f"Annotating : {args.from_log} ({len(log)} events) — replaying same game\n")
+        decisions = annotate_log(log, hero_agent, game_mode)
+        weight_name = Path(args.model or args.hf_file).name
+        title = f"RiichiEnv 牌譜(含模型解說)— riichippo {weight_name}"
+        subtitle = f"{arch['model_type']} | {game_mode} | 來源: {Path(args.from_log).name}"
+        commentary = build_commentary_html(decisions, n_players)
+        export_replay_html(None, args.export_html, title, subtitle,
+                           commentary_html=commentary, extra_css=COMMENTARY_CSS, log=log)
+        return
 
     if args.vs_random:
         from riichienv.agents import RandomAgent
